@@ -1,0 +1,294 @@
+---
+title: "2.Patchseq_QC"
+author: "Jack Gordon"
+date: "2024-04-15"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/jackgordon/Documents/DPhil/RNA-Sequencing/Patch-seq")
+```
+
+
+Calculates contamination from other cell types aftering finding markers from Saunders et al 2018.\
+Plots expression of neuronal vs. microglia markers.\
+Plots microglia contamination scores.
+
+###2. Patchseq_QC
+
+```{r, Patchseq_QC, message = FALSE, warning= FALSE}
+#Load libraries
+library(DropSeq.util)
+library(Seurat)
+library(dplyr)
+library(tidyr)
+library(patchSeqQC)
+library(patchseqtools)
+library(pheatmap)
+library(edgeR)
+library(ggplot2)
+library(plotrix)
+
+#Adapt functions from patchSeqQC
+defineClassMarkers <- function(datRef,
+                               onClasses,
+                               offClasses,
+                               numMarkers = 50) {
+  # Data prep and errors
+  if (is.null(colnames(datRef))) {
+    colnames(datRef) <- as.character(1:length(colnames(datRef)))
+  }
+  samples <- colnames(datRef)
+  
+  if (length(samples) != length(onClasses)) {
+    return("Error: onClasses is the wrong length.")
+  }
+  if (length(samples) != length(offClasses)) {
+    return("Error: onClasses is the wrong length.")
+  }
+  
+  offClasses <- factor(offClasses)
+  onClasses <- factor(onClasses)
+  names(onClasses) <- names(offClasses) <- samples
+  
+  # Caclulate proportions and medians
+  propExpr <- do.call("cbind", tapply(
+    names(onClasses),
+    onClasses, function(x) rowMeans(datRef[, x] > 1)
+  ))
+  propExpr <- propExpr[, levels(onClasses)]
+  medianExpr <- do.call("cbind", tapply(
+    names(onClasses),
+    onClasses, function(x) rowMeans(datRef[, x])
+  ))
+  medianExpr <- log2(medianExpr[, levels(onClasses)] + 1)
+  rownames(propExpr) <- rownames(medianExpr) <- rownames(datRef)
+  
+  propExprC <- do.call("cbind", tapply(
+    names(offClasses),
+    offClasses, function(x) rowMeans(datRef[, x] > 1)
+  ))
+  propExprC <- propExprC[, levels(offClasses)]
+  medianExprC <- do.call("cbind", tapply(
+    names(offClasses),
+    offClasses, function(x) rowMeans(datRef[, x])
+  ))
+  medianExprC <- log2(medianExprC[, levels(offClasses)] + 1)
+  rownames(propExprC) <- rownames(medianExprC) <- rownames(datRef)
+  
+  # Define and return markers
+  markers <- list()
+  
+  for (cn in colnames(propExpr)) {
+    a  <- (propExpr[, cn] - apply(propExpr[, colnames(propExpr) != cn, drop = FALSE], 1, mean))
+    b  <- ((medianExpr[, cn] - rowMeans(medianExpr[, colnames(medianExpr) != cn, drop = FALSE])) /
+             (medianExpr[, cn] + 1))
+    kp <- a * b * (a > 0) * (b > 0) * propExpr[, cn] * medianExpr[, cn] *
+      (medianExpr[, cn] >= 0) * (propExpr[, cn] >= 0.1) #Changed minimum expression and proportions of cells expresisng
+    markers[[paste0(cn, "_on")]] <- make.names(names(head(-sort(-kp), numMarkers)))
+  }
+  
+  for (cn in colnames(propExprC)) {
+    a  <- (propExprC[, cn] - apply(propExprC[, colnames(propExprC) != cn, drop = FALSE], 1, max))
+    b  <- ((medianExprC[, cn] - apply(medianExprC[, colnames(medianExprC) != cn, drop = FALSE], 1, max)) /
+             (medianExprC[, cn] + 1))
+    kp <- a * b * (a > 0) * (b > 0) * sqrt(medianExprC[, cn])
+    markers[[paste0(cn, "_off")]] <- make.names(names(head(-sort(-kp), numMarkers)))
+  }
+  
+  markers
+}
+
+plotMarkerHeatmap = function(markerlist, expr_matrix, show_legend = T, show_cell_labels = F, numMarkers = 10){
+  
+  ann_colors = list(Markers = c(Astrocyte_on = "brown", Microglia_on = "turquoise", 
+                                Oligodendrocyte_on = "blue", Neuron_on = "purple",
+                                Neuron_off = 'darkorange4', Non.neuronal_off = "orange"),
+                    CellTypes = c("aIP-derived" = "forestgreen", "OP-derived" = "firebrick3", "Unlabelled" = "grey"))
+  
+  # markerGeneList = c(ndnf_markers %>% head(10), l_affy$Pyramidal %>% head(10), l_affy$Microglia %>% head(10) )
+  trimmed_marker_list = lapply(markerlist, function(l) l %>% getValidGenes(., colnames(expr_matrix)) %>% make.names() %>% head(numMarkers))
+  markers_count = lapply(trimmed_marker_list, function(l) length(l)) %>% unlist
+  
+  all_trimmed_markers = unlist(trimmed_marker_list) %>% as.character()
+  # all_trimmed_markers = getValidGenes(all_trimmed_markers)
+  
+  expr_mat = expr_matrix[, all_trimmed_markers]
+  
+  
+  gaps_row = cumsum(markers_count)
+  
+  annotation_row = data.frame(Markers = factor(rep(names(markers_count),
+                                                   markers_count), levels = names(markers_count)))
+  rownames(annotation_row) = colnames(expr_mat[, all_trimmed_markers])
+  
+  annotation_col = data.frame(CellTypes = factor(expr_matrix$CellType))
+  
+  rownames(annotation_col) = rownames(expr_mat)
+  
+  MAXLOGEXPR = 10
+  breaksList = seq(0, MAXLOGEXPR, by = 0.5)
+  
+  #expr_mat[expr_mat > 2^MAXLOGEXPR] = 2^MAXLOGEXPR
+  
+  expr_mat = t(expr_mat)
+  
+  ann_colors_current = list()
+  ann_colors_current$Markers = ann_colors$Markers[names(markers_count)]
+  ann_colors_current$CellTypes = ann_colors$CellTypes[unique(expr_matrix$CellType)]
+  
+  plot_heatmap = pheatmap::pheatmap(expr_mat,
+                                    cluster_rows=F,
+                                    cluster_cols=F, gaps_row = gaps_row, annotation_colors = ann_colors_current,
+                                    annotation_col = annotation_col,
+                                    annotation_row = annotation_row, annotation_names_row = T, annotation_legend = F, show_colnames = show_cell_labels,
+                                    breaks = breaksList, color = colorRampPalette(rev(RColorBrewer::brewer.pal(n = 7, name = "RdYlBu")))(length(breaksList)),
+                                    legend = show_legend, fontsize = 10)
+  plot_heatmap
+}
+
+#Construct seurat object from Saunders data and filter low quality cells
+dge.path <- "data/integration/F_GRCm38.81.P60Striatum.raw.dge.txt.gz"
+counts <- loadSparseDge(dge.path) 
+
+outcomes <- readRDS("data/integration/F_GRCm38.81.P60Striatum.cell_cluster_outcomes.RDS")
+annotations <- readRDS("data/integration/annotation.BrainCellAtlas_Saunders_version_2018.04.01.RDS")
+
+#Assign classes to striatal cells based on cluster - non neuronal vs. neuronal cell types
+outcomes$class[outcomes$cluster == 6] <- "Microglia"
+outcomes$class[outcomes$cluster == 4] <- "Astrocyte"
+outcomes$class[outcomes$cluster == 3] <- "Oligodendrocyte"
+outcomes$class[outcomes$cluster %in% c(10, 11, 13)] <- "Neuron" 
+
+saunders <- CreateSeuratObject(counts = counts, meta.data = outcomes) 
+saveRDS(saunders, "data/integration/saunders_unfiltered.rds")
+saunders <- readRDS("data/integration/saunders_unfiltered.rds")
+
+#Filter out low quality cells 
+meta <- as.data.frame(saunders@meta.data)
+meta$reason <- as.character(meta$reason)
+meta <- meta %>% replace_na(list(reason = "none"))
+saunders$reason <- meta$reason
+saunders <- subset(saunders, subset = reason == "none") #keep cells with no reason to exclude
+
+#Process saunders data with seurat workflow and save
+saunders <- FindVariableFeatures(saunders, assay = "RNA", nfeatures = 2000)
+saunders <- NormalizeData(saunders)
+saunders <- ScaleData(saunders)
+saunders@active.ident <- as.factor(saunders$class)
+saveRDS(saunders, "data/integration/saunders_filtered.rds")
+saunders <- readRDS("data/integration/saunders_filtered.rds")
+
+#Define on classes for cell types in saunders
+onClasses <- as.factor(saunders$class)
+#Define off class as neurons for non-neuronal cells and non-neuronal cells for neurons (SPNs)
+offClasses <- as.factor(ifelse(saunders$class == "Neuron", "Non-neuronal", "Neuron")) 
+
+#Extract and save normalised count matrix froms seurat object
+datRef <- as.data.frame(saunders[["RNA"]]$data)
+saveRDS(datRef, "data/saunders.count.matrix.rds")
+datRef<- readRDS("data/saunders.count.matrix.rds")
+
+#Find on and off markers for different cell classes in saunders 
+markers <- defineClassMarkers(datRef, onClasses = onClasses, offClasses = offClasses, 
+                              numMarkers = 50) #Define class markers
+write.csv(markers, "results/qc/class_markers.csv")
+markers <- as.data.frame(read.csv("results/qc/class_markers.csv"))
+markers <- as.list(markers %>% dplyr::select(!X))
+
+#Plot heatmap of neuronal and non-neuronal marker expression for each cell 
+#Load in sample seurat and access normalised counts as matrix
+sce <- readRDS("data/filtered_sce.rds")
+seurat <- as.Seurat(sce)
+seurat <- FindVariableFeatures(seurat, assay = "originalexp", nfeatures = 2000)
+seurat <- NormalizeData(seurat)
+seurat <- ScaleData(seurat)
+
+#Transpose and add metadata as columns to matrix
+sample.matrix <- t((seurat[["originalexp"]]$data))
+sample.df <- as.data.frame(sample.matrix)
+sample.df$CellType <- sce$Progenitor.Origin
+rownames(sample.df) <- colnames(sce)
+sample.df <- sample.df %>% arrange(CellType)
+expr_matrix <- sample.df
+
+#Select marker genes to plot for cell types
+plot_cell_types <- c("Neuron_on", "Microglia_on")
+markerlist <- c(markers[plot_cell_types])
+
+
+#Plot heatmap - average per group
+avg_expr <- as.data.frame(AverageExpression(seurat, features = unlist(markers), group.by = "Progenitor.Origin", 
+                              assay = "originalexp", layer = "data"))
+
+t.avg_expr <- as.data.frame(t(avg_expr))
+rownames(t.avg_expr) <- c("aIP-derived", "OP-derived", "Unlabelled")
+t.avg_expr$CellType <- c("aIP-derived", "OP-derived", "Unlabelled")
+
+markerlist$Neuron_on <- c("Hpca", "Camk2b", "Gria2a", "Arpp21", 
+                          "Map1b", "Snap25", "Rtn1", "Ndrg4", "Ppp1rb1")
+
+markerlist$Microglia_on <- c("C1qc", "Cx3cr1", "Cd53", "C1qa", "Gpr34", 
+                             "Csf1r", "B2m", "P2ry12", "Siglech", "Aif1")
+
+marker.heatmap <- plotMarkerHeatmap(markerlist = markerlist, 
+                                    expr_matrix = t.avg_expr, 
+                                    show_legend = TRUE, show_cell_labels = FALSE)
+
+#Calculate microglia contamination
+#Load markers
+markers <- as.data.frame(read.csv("results/qc/class_markers.csv"))
+markers <- as.list(markers %>% dplyr::select(!X))
+
+#pat_df - matrix with rows=samples and columns=genes and metadata
+sce <- readRDS("data/filtered_sce.rds")
+seurat <- as.Seurat(sce, counts = "counts")
+seurat <- FindVariableFeatures(seurat, assay = "originalexp", nfeatures = 2000)
+seurat <- NormalizeData(seurat)
+seurat <- ScaleData(seurat)
+
+#Transpose and add metadata as columns to matrix - store as pat_df
+sample.matrix <- t((seurat[["originalexp"]]$data))
+sample.df <- as.data.frame(sample.matrix)
+sample.df$major_type <- "Neuron"
+sample.df$contam_type <- "Neuron"
+rownames(sample.df) <- colnames(sce)
+pat_df <- sample.df
+
+#Calculate summed expresion of neuron vs. microglia markers for samples
+targets = markers$Neuron_on[1:10] #On markers 
+comparison = markers$Microglia_on[1:10]#Microglia marker
+marker_pat_df <- pat_df[, colnames(pat_df) %in% targets]
+target_expr <- rowSums(marker_pat_df)
+compare_pat_df <- pat_df[, colnames(pat_df) %in% comparison]
+comp_expr = rowSums(compare_pat_df)
+sumMarkerExpression <- as.data.frame(cbind(target_expr, comp_expr))
+sumMarkerExpression <- sumMarkerExpression %>% mutate(contam_score = (comp_expr / target_expr)/10)
+sumMarkerExpression$contam_score[sumMarkerExpression$contam_score > 1] <- 1
+sumMarkerExpression$Progenitor.Origin <- as.factor(sce$Progenitor.Origin)
+write.csv(sumMarkerExpression, "results/qc/microglia.contam.csv")
+microglia.qc <- as.data.frame(read.csv("results/qc/microglia.contam.csv"))
+
+microglia.contam.summary <- sumMarkerExpression %>% group_by(Progenitor.Origin) %>%
+  summarise(across(everything(), list(mean = mean, sem = std.error)))
+write.csv(microglia.contam.summary, "results/qc/microglia.contam.summary.csv")
+
+
+library(ggpubr)
+levels(sumMarkerExpression$Progenitor.Origin) <- c("aIP-derived", "OP-derived", "Unlabelled")
+level_order <- c("OP-derived", "aIP-derived", "Unlabelled")
+cols <- c('forestgreen', 'firebrick3', 'darkgray')
+names(cols) = levels(sumMarkerExpression$Progenitor.Origin)
+
+ggbarplot(sumMarkerExpression, x = "Progenitor.Origin", y = "contam_score", fill = "Progenitor.Origin", 
+          palette = cols, add = c("mean_se"), order = level_order,
+          error.plot = "upper_errorbar", add.params = list(color = "black", alpha = 0.5)) + 
+  theme_classic(base_size = 15) + theme(legend.position = "none") + xlab("") + ylab("Microglia Contamination Score")
+```
+
+
+```{r, sessionInfo}
+sessionInfo()
+```
+
+
