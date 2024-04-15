@@ -1,0 +1,262 @@
+---
+title: "5.Subtype_prediction"
+author: "Jack Gordon"
+date: "2024-04-15"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/jackgordon/Documents/DPhil/RNA-Sequencing/Patch-seq")
+```
+
+
+Predicts aIP and OP-derived SPN subtypes from Saunders et al 2018 reference.\
+Plots predicted subtype breakdowns. \
+
+### 5. Subtype prediction
+```{r, subtype prediction, message = FALSE, warning= FALSE}
+#Load libraries
+library(DropSeq.util)
+library(limma)
+library(scuttle)
+library(dplyr)
+library(plyr)
+library(tidyr)
+library(Rphenograph)
+library(WGCNA)
+library(Matrix)
+library(scrattch.hicat)
+
+#Load in saunders single cell experiment object
+saunders_sce <- readRDS("data/integration/saunders_sce_neuron.rds")
+
+#Set clusters and type_markers from Saunders dataset that we will use for mapping
+clusters <- c(10, 11)
+type_markers <-c("Drd1-Pde1a", "Drd1-Lypd1","Drd1-Nefm", "Adora2a-Nnat", "Adora2a-Nefm")
+
+#Load in metacell annotations and individual sample outcomes from Saunders dataset
+outcomes <- readRDS("data/integration/F_GRCm38.81.P60Striatum.cell_cluster_outcomes.RDS")
+annotations <- readRDS("data/integration/annotation.BrainCellAtlas_Saunders_version_2018.04.01.RDS")
+
+#Wrangle annotations and outcomes to form reference dataframe labels
+annotations <- subset(annotations, tissue == "STR" & class == "NEURON") #Select striatum and neuronal metacells
+annotations$cluster <- outcomes$cluster[match(annotations$subcluster, outcomes$subcluster)] #Match clusters to outcomes
+annotations <- subset(annotations, cluster %in% clusters) #Subset for SPN clusters
+annotations <- subset(annotations, type_marker %in% type_markers) #Subset for SPN subtypes
+annotations$subcluster <- as.factor(annotations$subcluster) #Convert to factor
+
+outcomes <- subset(outcomes, is.na(outcomes$reason)) #Remove filtered cells
+outcomes <- subset(outcomes, cluster %in% clusters) #Keep SPN clusters
+outcomes$type_marker <- annotations$type_marker[match(outcomes$subcluster, annotations$subcluster)] #Find type_markers
+outcomes <- subset(outcomes, type_marker %in% type_markers) #Subset for SPN subtypes
+outcomes$sample_id <- rownames(outcomes) #Set sample_id as rownames from outcomes
+
+outcomes$subcluster <- revalue(outcomes$subcluster, c("10-1" = "10.1", 
+                                                      "10-2" = "10.2",
+                                                      "10-3" = "10.3",
+                                                      "10-4" = "10.4",
+                                                      "10-5" = "10.5",
+                                                      "11-1" = "11.1",
+                                                      "11-2" = "11.2",
+                                                      "11-3" = "11.3"))
+
+
+annotations$subcluster <- revalue(annotations$subcluster, c("10-1" = "10.1", 
+                                                            "10-2" = "10.2",
+                                                            "10-3" = "10.3",
+                                                            "10-4" = "10.4",
+                                                            "10-5" = "10.5",
+                                                            "11-1" = "11.1",
+                                                            "11-2" = "11.2",
+                                                            "11-3" = "11.3")) #Convert subclusters to syntatic labels
+
+#Set up the ref.cl.df object 
+ref.cl.df <- annotations[, c("subcluster", "type_marker", "class")] #Take columns from annotations
+colnames(ref.cl.df)[1:3] <- c("cluster_id", "cluster_label", "broad type") #Convert to Allen Standards
+ref.cl.df <- arrange(ref.cl.df, cluster_id) #Sort by cluster_id
+ref.cl.df$cluster_id <- as.factor(ref.cl.df$cluster_id) #Convert to factor
+row.names(ref.cl.df) <- ref.cl.df$cluster_id #Set rownames of the reference to cluster_id
+
+#Set up ref cl factor object
+ref.cl <- setNames(factor(outcomes$subcluster), outcomes$sample_id) #Take subclusters of every sample for mapping
+
+#Normalise saunders dataset to counts per million and log transform - convert to SparseMatrix - norm.dat
+cpm(saunders_sce) <- calculateCPM(saunders_sce)
+norm.dat <- log2(SingleCellExperiment::cpm(saunders_sce) + 1)
+norm.dat <- Matrix(norm.dat, sparse = TRUE)  
+
+
+#Load in highly variable genes across integrated reference and sample dataset to use in classifier - from seurat
+features <- readRDS("data/integration/seurat.integration.genes.rds")
+
+#Load in and normalise our dataset and filter into separate test datasets for aIP, OP and unlabelled neurons for mapping
+my.sce <- readRDS("data/filtered_sce.rds")
+
+aIP <- my.sce[, my.sce$Progenitor.Origin == 'aIP-derived']
+OP <- my.sce[, my.sce$Progenitor.Origin == 'OP-derived']
+Unlabelled <- my.sce[, my.sce$Progenitor.Origin == 'Unlabelled']
+
+#Map aIP-derived
+cpm(aIP) <- calculateCPM(aIP)
+aIP <- log2(SingleCellExperiment::cpm(aIP) + 1) #Convert raw counts to counts per million and log-transform
+
+#Map our data to reference 
+mapping_results <- map_sampling(train.dat    = norm.dat,
+                                train.cl     = ref.cl,
+                                test.dat     = aIP,
+                                markers      = features,
+                                markers.perc = 0.8, #Use 80% of markers in each iteration
+                                iter         = 100) #Perform 100 iterations of mapping
+
+#Create results dataframe
+aIP.map.df <- mapping_results$map.df %>%
+  mutate(pred.cl = as.factor(pred.cl)) %>%
+  left_join(ref.cl.df, by = c("pred.cl" = "cluster_id"))
+
+#See results
+write.csv(aIP.map.df, file = "results/subtype.predictions/aIP.derived.predictions.csv") #Export results to csv
+
+#Map OP-derived
+cpm(OP) <- calculateCPM(OP)
+OP <- log2(SingleCellExperiment::cpm(OP) + 1)
+
+#Map our data to reference 
+mapping_results <- map_sampling(train.dat    = norm.dat,
+                                train.cl     = ref.cl,
+                                test.dat     = OP,
+                                markers      = features,
+                                markers.perc = 0.8,
+                                iter         = 100)
+
+#Create results dataframe
+OP.map.df <- mapping_results$map.df %>%
+  mutate(pred.cl = pred.cl) %>%
+  left_join(ref.cl.df, by = c("pred.cl" = "cluster_id"))
+
+#See results
+write.csv(OP.map.df, file = "results/subtype.predictions/OP.derived.hicat.predictions.csv")
+
+#Map Unlabelled
+cpm(Unlabelled) <- calculateCPM(Unlabelled)
+Unlabelled <- log2(SingleCellExperiment::cpm(Unlabelled) + 1)
+
+#Map our data to reference 
+mapping_results <- map_sampling(train.dat    = norm.dat,
+                                train.cl     = ref.cl,
+                                test.dat     = Unlabelled,
+                                markers      = features,
+                                markers.perc = 0.8,
+                                iter         = 100)
+
+#Create results dataframe
+Unlabelled.map.df <- mapping_results$map.df %>%
+  mutate(pred.cl = as.factor(pred.cl)) %>%
+  left_join(ref.cl.df, by = c("pred.cl" = "cluster_id"))
+
+#See results
+write.csv(Unlabelled.map.df, file = "results/subtype.predictions/Unlabelled.predictions.csv")
+```
+
+```{r, classifier plots, warning = FALSE, message = FALSE}
+#Load libraries 
+library(dplyr)
+library(ggpubr)
+
+#Colours for plotting
+aIP_cols <- c("#339900", "#336600", "#66CC33")
+OP_cols <- c("#CC0000", "#990000", "#CC0033")
+saunders_cols <- c("#0033CC", "#3366FF", "#6699FF")
+
+#Labels to split iSPN and dSPN populations
+iSPNs <- c("Adora2a-Nnat","Adora2a-Nefm")
+dSPNs <- c("Drd1-Pde1a", "Drd1-Lypd1", "Drd1-Nefm")
+type_markers <- c("Adora2a-Nnat","Adora2a-Nefm", "Drd1-Pde1a", "Drd1-Lypd1", "Drd1-Nefm")
+
+#Load in results tables
+aIP_results <- as.data.frame(read.csv("results/subtype.predictions/aIP.derived.predictions.csv"))
+OP_results <- as.data.frame(read.csv("results/subtype.predictions/OP.derived.hicat.predictions.csv"))
+aIP_results <- aIP_results %>% mutate(classified = ifelse(prob < 0.5, "Unclassified", "Classified"))
+OP_results <- OP_results %>% mutate(classified = ifelse(prob < 0.5, "Unclassified", "Classified"))
+
+#Convert probabilites below 0.5 to "Unclassified" and plot classification success
+aIP_classified <- aIP_results %>% group_by(classified) %>% dplyr::summarise(n = n()) %>% mutate(percent = n/sum(n)*100)
+
+ggpie(aIP_classified, x = "percent", fill  = "classified", palette = aIP_cols, label = "classified") +
+  theme(legend.position = "none") + xlab("") + ylab("")
+
+#Assign dSPN or iSPN and plot results
+aIP_pathways <- aIP_results %>% mutate(pathway = ifelse(cluster_label %in% dSPNs, "dSPN", "iSPN")) %>% 
+  dplyr::filter(classified == "Classified") %>%
+  group_by(pathway) %>%
+  dplyr::summarise(n = n()) %>% dplyr::mutate(percent = n/sum(n)*100)
+
+#Split by iSPN and dSPNs and plot results
+aIP_iSPN.labels <- aIP_results %>% dplyr::filter(classified == "Classified") %>%
+  dplyr::filter(cluster_label %in% iSPNs) %>% group_by(cluster_label) %>% 
+  dplyr::summarise(n = n()) %>% dplyr::mutate(percent = n/sum(n)*100)
+
+aIP_dSPN.labels <- aIP_results %>% dplyr::filter(classified == "Classified") %>%
+  dplyr::filter(cluster_label %in% dSPNs) %>% group_by(cluster_label) %>% 
+  dplyr::summarise(n = n()) %>% dplyr::mutate(percent = n/sum(n)*100)
+
+ggpie(aIP_pathways, x = "percent", label = "pathway", fill  = "pathway", palette = aIP_cols) +
+  theme(legend.position = "none") + xlab("") + ylab("")
+
+ggpie(aIP_iSPN.labels, x = "percent", label = "cluster_label", fill  = "cluster_label", palette = aIP_cols) +
+  theme(legend.position = "none") + xlab("") + ylab("")
+
+
+ggpie(aIP_dSPN.labels, x = "percent", label = "cluster_label", fill  = "cluster_label", palette = aIP_cols) +
+  theme(legend.position = "none") + xlab("") + ylab("")
+
+#OP-derived neurons 
+OP_classified <- OP_results %>% group_by(classified) %>% dplyr::summarise(n = n()) %>% mutate(percent = n/sum(n)*100)
+
+ggpie(OP_classified, x = "percent", fill  = "classified", palette = OP_cols, label = "classified") +
+  theme(legend.position = "none") + xlab("") + ylab("") 
+
+
+#Assign dSPN or iSPN and plot results
+OP_pathways <- OP_results %>% mutate(pathway = ifelse(cluster_label %in% dSPNs, "dSPN", "iSPN")) %>% 
+  dplyr::filter(classified == "Classified") %>%
+  group_by(pathway) %>%
+  dplyr::summarise(n = n()) %>% dplyr::mutate(percent = n/sum(n)*100)
+
+ggpie(OP_pathways, x = "percent", label = ="pathway", fill  = "pathway", palette = OP_cols) +
+  theme(legend.position = "none") + xlab("") + ylab("")
+
+
+#Split by iSPN and dSPNs and plot results
+OP_iSPN.labels <- OP_results %>% dplyr::filter(classified == "Classified") %>%
+  dplyr::filter(cluster_label %in% iSPNs) %>% group_by(cluster_label) %>% 
+  dplyr::summarise(n = n()) %>% dplyr::mutate(percent = n/sum(n)*100)
+
+OP_dSPN.labels <- OP_results %>% dplyr::filter(classified == "Classified") %>%
+  dplyr::filter(cluster_label %in% dSPNs) %>% group_by(cluster_label) %>% 
+  dplyr::summarise(n = n()) %>% dplyr::mutate(percent = n/sum(n)*100)
+
+ggpie(OP_iSPN.labels, x = "percent", label = "cluster_label", fill  = "cluster_label", palette = OP_cols) +
+  theme(legend.position = "none") + xlab("") + ylab("")
+
+ggpie(OP_dSPN.labels, x = "percent", label = "cluster_label", fill  = "cluster_label", palette = OP_cols) +
+  theme(legend.position = "none") + xlab("") + ylab("")
+
+
+#Plot classifier probabilities
+p <- gghistogram(aIP_results, x = "prob", y = "count", fill = "forestgreen", bins = 7, alpha = 1, 
+            xlab = "Classifier Probability", ylab = "Frequency") + theme_classic(base_size = 20) +
+  geom_vline(xintercept = 0.5, colour = "black", linetype = "dashed", linewidth = 2)
+p <- ggpar(p, xlim = c(0.2, 1))
+p
+
+p <- gghistogram(OP_results, x = "prob", y = "count", fill = "firebrick3", bins = 7, alpha = 1, 
+                 xlab = "Classifier Probability", ylab = "Frequency") + theme_classic(base_size = 20) +
+  geom_vline(xintercept = 0.5, colour = "black", linetype = "dashed", linewidth = 2)
+p <- ggpar(p, xlim = c(0.2, 1))
+p
+```
+
+```{r, sessionInfo}
+sessionInfo()
+```
+

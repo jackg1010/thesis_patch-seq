@@ -1,0 +1,115 @@
+---
+title: "4.Integration"
+author: "Jack Gordon"
+date: "2024-04-15"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/jackgordon/Documents/DPhil/RNA-Sequencing/Patch-seq")
+```
+
+
+Integrates patch-seq dataset with reference SPN dataset from Saunders et al 2018.\
+Runs integrated dimensionality reduction, plots integrated tSNE.\
+
+### 4. Integration
+```{r, Integration, message = FALSE, warning= FALSE}
+#Load required packages
+library(SingleCellExperiment)
+library(scran)
+library(dplyr)
+library(Seurat)
+library(ggplot2)
+library(ggpubr)
+
+#Load in sample single cell experiment
+my.sce <- readRDS("data/filtered_sce.rds")
+
+#Load in reference single cell experiment and filter for subtypes of interest
+saunders.sce <- readRDS("data/integration/saunders_sce_neuron.rds")
+type_markers <-c("Drd1-Pde1a", "Drd1-Lypd1","Drd1-Nefm", 
+                 "Adora2a-Nnat", "Adora2a-Nefm")
+saunders.sce <- saunders.sce[, saunders.sce$type_marker %in% type_markers] #Keep only relevant subtypes
+
+#Convert to seurat objects for merging
+sce.seurat <- CreateSeuratObject(counts = assays(my.sce)[["counts"]])
+sce.seurat@meta.data[, "dataset"] <- 1
+sce.seurat@meta.data[, "group"] <- colData(my.sce)$Progenitor.Origin
+sce.seurat@meta.data[, "progenitor.origin"] <- colData(my.sce)$Progenitor.Origin
+
+saunders.seurat <- CreateSeuratObject(counts = assays(saunders.sce)[["counts"]])
+saunders.seurat@meta.data[, "dataset"] <- 2
+saunders.seurat@meta.data[, "group"] <- colData(saunders.sce)$type_marker
+saunders.seurat@meta.data[, "progenitor.origin"] <- "reference"
+
+#Normalise and find 2000 highly variable genes for the two datasets separately
+sce.list <- c(sce.seurat, saunders.seurat)
+sce.list <- lapply(X = sce.list, FUN = function(x) {
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+})
+
+#Select features that are repeatedly variable across datasets for integration and save as csv and RData objects
+features <- SelectIntegrationFeatures(object.list = sce.list)
+saveRDS(features, "data/integration/seurat.saunders.integration.genes.rds")
+write.csv(features, "results/seurat.saunders.integration.genes.csv")
+features <- readRDS("data/integration/seurat.saunders.integration.genes.rds")
+
+#Find integration anchors, integrate data and set integrated as default assay
+anchors <- FindIntegrationAnchors(object.list = sce.list, anchor.features = features)
+sce.combined <- IntegrateData(anchorset = anchors, k.weight = 92)
+DefaultAssay(sce.combined) <- "integrated"
+
+#Scale data
+sce.combined <- ScaleData(sce.combined, verbose = FALSE)
+
+#Dimensionality reduction - tSNE seems to work best
+sce.combined <- RunPCA(sce.combined, npcs = 30, features = features)
+sce.combined <- RunTSNE(sce.combined, reduction = "pca", features = features)
+sce.combined <- RunUMAP(sce.combined, reduction = "pca", features = features)
+
+saveRDS(sce.combined, "data/integration/intergrated.saunders.sample.seurat.rds") #Save integrated dataset
+
+sce.combined <- readRDS("data/integration/intergrated.saunders.sample.seurat.rds")
+
+#Plotting results - combined tSNE
+sce.combined <- sce.combined[, !is.na(sce.combined$group)] #Drop unlabelled sample cells
+sce.combined@active.ident <- as.factor(sce.combined$group) #Set active identity as group
+
+var1_cells <- WhichCells(sce.combined,  idents = c("aIP-derived"))
+var2_cells <- WhichCells(sce.combined, idents = c( "OP-derived")) #Select sample cells to highlight
+
+set.seed(13)
+plot <- DimPlot(sce.combined, reduction = "tsne",  group.by = "group", pt.size = 3,
+                cells.highlight= list(var1_cells, var2_cells), cols.highlight = c("forestgreen", "firebrick3"), 
+                sizes.highlight = 8, cols = "grey")
+plot <- LabelClusters(plot, id = "group", clusters = type_markers, box = TRUE, size = 10) + 
+  theme_classic(base_size = 20) +
+  theme(plot.title = element_blank(), legend.position = "none") + 
+  scale_color_discrete(labels = c("Reference", "aIP-derived", "OP-derived"), 
+                       type = c("grey", "forestgreen", "firebrick3"))
+plot
+
+
+#Plotting results
+saunders.sce <- sce.combined[, sce.combined$group %in% type_markers] 
+plot <- FeaturePlot(saunders.sce, features = c("Adora2a"), 
+                    reduction = "tsne", pt.size = 2) +
+  theme_classic(base_size = 20)
+plot <- LabelClusters(plot, id = "ident", clusters = type_markers, box = TRUE, size = 5)
+plot
+
+
+plot <- FeaturePlot(saunders.sce, features = c("Drd1"), 
+                    reduction = "tsne", pt.size = 2) +
+  theme_classic(base_size = 20)
+plot <- LabelClusters(plot, id = "ident", clusters = type_markers, box = TRUE, size = 5)
+plot
+
+```
+
+
+```{r, sessionInfo}
+sessionInfo()
+```

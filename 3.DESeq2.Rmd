@@ -1,0 +1,121 @@
+---
+title: "3.DESeq2"
+author: "Jack Gordon"
+date: "2024-04-15"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/jackgordon/Documents/DPhil/RNA-Sequencing/Patch-seq")
+```
+
+
+Processes dataset with zinbwave.\
+Performs pseudo-bulk deseq2 between aIP-derived and OP-derived SPNs.\
+
+###3. DESeq2
+```{r, DESeq2, message = FALSE, warning= FALSE, eval = FALSE}
+#Load libraries
+library(dplyr)
+library(SingleCellExperiment)
+library(DESeq2)
+library(scran)
+library(EnhancedVolcano)
+library(zinbwave)
+library(limma)
+library(ggpubr)
+
+#Load in single cell experiment object 
+my_sce <- readRDS("data/filtered_sce.rds")
+
+#Filter for aIP- and OP-derived neurons to exclude unlabelled neurons from the comparisons
+labelled <- c("aIP-derived", "OP-derived")
+sce <- my_sce[, my_sce$Progenitor.Origin %in% labelled]
+sce$Progenitor.Origin <- factor(sce$Progenitor.Origin, levels = c("OP-derived","aIP-derived"))
+
+#Zinbwave modelling to estimate size factors
+#Filter out low expressed genes (less than 5 reads in less than 5 cells)
+filter <- rowSums(counts(sce)>5)>5
+sce <- sce[filter,]
+assayNames(sce)[1] <- "counts" 
+#Convert counts to integers and add back to sce
+counts <- as.matrix(assays(sce)$counts)
+mode(counts) <- "integer"
+assays(sce)$counts <- counts
+
+#Run zinbwave model
+sce_zinb <- zinbwave(sce, K = 1, epsilon=1e12) #Run zinbwave model - params from Ellender et al 2019 
+saveRDS(sce_zinb, "data/deseq2/filtered.sce.zinbwave.rds") #Save object
+sce_zinb <- readRDS("data/deseq2/filtered.sce.zinbwave.rds") #Load object
+
+#Create DESeq2 object from sce_zinb
+dds <- DESeqDataSet(sce_zinb, design = ~Progenitor.Origin)
+
+#Run differential expression analysis comparing SPNs with different progenitor origins
+dds <- DESeq(dds, test="LRT", reduced=~1, sfType="poscounts", useT=TRUE, minmu=1e-6)
+res <- results(dds) 
+
+#Log FC shrinage for visualisation (optional)
+resLFC <- lfcShrink(dds, coef = "Progenitor.Origin_aIP.derived_vs_OP.derived", type="apeglm")
+resLFC
+
+#Order results by p-value and set threshold
+resOrdered <- res[order(res$padj),]
+res01 <- results(dds, alpha=0.01)
+summary(res01)
+res01 <- as.data.frame(res01) %>% dplyr::filter(padj <= 0.01)
+write.csv(res01, file = "results/differential.expression/zinbwave-deseq2.significant.de.genes.csv")
+res01 <- read.csv("results/differential.expression/zinbwave-deseq2.significant.de.genes.csv")
+
+to.label <- c("Hivep2", "Denr", "Trem2", "Dpp7", "Auts2", "Nipa2", "Egr2", "Prex1", "Mcr1") #Select interesting genes to label
+
+#Plot results using Enhanced Volvano
+plot <- EnhancedVolcano(res, lab = rownames(res), x = 'log2FoldChange', y = 'padj', 
+                         pCutoff = 0.01, selectLab = to.label, FCcutoff = 2.5, max.overlaps = Inf,
+                         drawConnectors = TRUE, boxedLabels = TRUE, pointSize = 10, labSize = 5) + 
+  xlim(-10, 10) + ylim(0, 4)
+
+#Plot selected genes counts
+#Plot counts for prex1
+prex1 <- plotCounts(dds, gene="Prex1", intgroup="Progenitor.Origin", 
+                    returnData=TRUE) #Create dataframe with count data for gene of interest
+prex1$Progenitor.Origin <- factor(prex1$Progenitor.Origin, levels = c("aIP.derived", "OP.derived"))
+filter <- prex1$count >0.5
+prex1 <- prex1[filter,]
+
+#Set colours and levels for groups and save comparisons
+cols <- c('forestgreen', 'firebrick3')
+names(cols) = levels(prex1$Progenitor.Origin)
+my.comparisons <- list(c("aIP-derived", "OP-derived"))
+
+ggstripchart(prex1, x = "Progenitor.Origin", y = "count", fill = "Progenitor.Origin", order = c("OP.derived", "aIP.derived"), color = "Progenitor.Origin", palette = cols, size = 5, add = c("mean_se"), 
+                  add.params = list(color = 'black', alpha = 0.5, size = 1)) +
+  theme_classic(base_size = 15) + theme(legend.position = "none") + xlab("") + ylab("Normalised Counts") + ggtitle("Prex1")
+
+#Plot counts for egr2
+egr2 <-  plotCounts(dds, gene="Egr2", intgroup="Progenitor.Origin", returnData = TRUE)
+filter <- egr2$count >0.5
+egr2 <- egr2[filter,]
+egr2$Progenitor.Origin <- factor(egr2$Progenitor.Origin, levels = c("aIP.derived", "OP.derived"))
+
+ggstripchart(egr2, x = "Progenitor.Origin", y = "count", fill = "Progenitor.Origin", order = c("OP-derived", "aIP-derived"),
+                  color = "Progenitor.Origin", palette = cols, size = 5, add = c("mean_se"), 
+                  add.params = list(color = 'black', alpha = 0.5, size = 1)) +
+  theme_classic(base_size = 15) + theme(legend.position = "none") + xlab("") + ylab("Normalised Counts") + ggtitle("Egr2")
+```
+```{r, plots, echo = FALSE}
+library(cowplot)
+
+fig_svg<-cowplot::ggdraw()+cowplot::draw_image("plots/deseq2.plots/volcano.svg")
+plot(fig_svg)
+
+fig_svg<-cowplot::ggdraw()+cowplot::draw_image("plots/deseq2.plots/prex1.svg")
+plot(fig_svg)
+
+fig_svg<-cowplot::ggdraw()+cowplot::draw_image("plots/deseq2.plots/egr2.svg")
+plot(fig_svg)
+````
+
+```{r, sessionInfo}
+sessionInfo()
+```
