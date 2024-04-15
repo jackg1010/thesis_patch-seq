@@ -3,7 +3,7 @@ Repository hosts the analysis code for adult patch-seq data of aIP and OP-derive
 
 Pipeline:
 
-  1. Processing, Filtering & Normalisation
+  1. Processing
   - Creates single cell experiment objects from kallisto outputs
   - Remove low quality cells
   - Normalises data
